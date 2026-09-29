@@ -134,6 +134,7 @@ def print_banner():
     """
     print0(banner)
 
+# **torchrun 只负责启动和管理进程、设置分布式环境；
 def is_ddp_requested() -> bool:
     """
     True if launched by torchrun (env present), even before init.
@@ -198,8 +199,8 @@ def compute_init(device_type="cuda"): # cuda|cpu|mps
     if is_ddp_requested and device_type == "cuda":
         device = torch.device("cuda", ddp_local_rank)
         torch.cuda.set_device(device)  # make "cuda" default to this device
-        dist.init_process_group(backend="nccl", device_id=device)
-        dist.barrier()
+        dist.init_process_group(backend="nccl", device_id=device) # 它会初始化 PyTorch 的分布式进程组，让各个独立的训练进程能够互相通信。
+        dist.barrier() # 每个进程执行到这里后都会暂停，直到通信组内的所有进程都执行到这里，大家才一起继续。
     else:
         device = torch.device(device_type) # mps|cpu
 

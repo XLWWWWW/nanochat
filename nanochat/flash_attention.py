@@ -25,7 +25,7 @@ def _load_flash_attention_3():
     if not torch.cuda.is_available():
         return None
     try:
-        major, _ = torch.cuda.get_device_capability()
+        major, _ = torch.cuda.get_device_capability() # 它代表 NVIDIA GPU 所支持的 CUDA 硬件架构和功能集合
         # FA3 kernels are currently compiled for Hopper (sm90), Ada (sm89) and Ampere (sm80/sm86)
         # Blackwell (sm100) needs SDPA fallback until FA3 is recompiled or FA4 is released
         import os
@@ -77,7 +77,7 @@ USE_FA3 = _resolve_use_fa3()
 def _sdpa_attention(q, k, v, window_size, enable_gqa):
     """
     SDPA attention with sliding window support.
-    q, k, v are (B, H, T, D) format.
+    q, k, v are (Batch, Head, Timesteps, Dim) format.
     """
     Tq = q.size(2)
     Tk = k.size(2)
@@ -88,6 +88,7 @@ def _sdpa_attention(q, k, v, window_size, enable_gqa):
         return F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=enable_gqa)
 
     # Single token generation
+    # 手动裁减window长的k和v
     if Tq == 1:
         if window >= 0 and window < Tk:
             # window is "left" tokens we need to include (window + 1) keys total
@@ -97,6 +98,7 @@ def _sdpa_attention(q, k, v, window_size, enable_gqa):
         return F.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=enable_gqa)
 
     # Need explicit mask for sliding window/chunk inference
+    # 构造出既满足casual 和 windowed 的mask 用于query的seqlen>1时给 scaled_dot_product_attention 计算
     device = q.device
     # For chunk inference (Tq != Tk), is_causal is not aligned to cache position => build an explicit bool mask
     row_idx = (Tk - Tq) + torch.arange(Tq, device=device).unsqueeze(1)

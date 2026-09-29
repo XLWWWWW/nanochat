@@ -77,7 +77,7 @@ parser.add_argument("--sample-every", type=int, default=2000, help="sample from 
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
-args = parser.parse_args()
+args = parser.parse_args() #  真正读取运行脚本时传入的 CLI 参数，并保存到 args。
 user_config = vars(args).copy()  # for logging
 # -----------------------------------------------------------------------------
 # Compute init and wandb logging
@@ -85,7 +85,7 @@ user_config = vars(args).copy()  # for logging
 device_type = autodetect_device_type() if args.device_type == "" else args.device_type
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
 master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
-synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
+synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None   # synchronize 等待当前进程与当前 GPU 完成任务
 get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
 if device_type == "cuda":
     gpu_device_name = torch.cuda.get_device_name(0)
@@ -100,6 +100,7 @@ use_dummy_wandb = args.run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=args.run, config=user_config)
 
 # Flash Attention status
+# 根据显卡型号和数据类型选择 scaled dot product attention算子
 from nanochat.flash_attention import USE_FA3
 using_fa3 = USE_FA3
 if using_fa3:
@@ -130,24 +131,24 @@ def build_model_meta(depth):
     """Build a model on meta device for a given depth (shapes/dtypes only, no data)."""
     # Model dim is nudged up to nearest multiple of head_dim for clean division
     # (FA3 requires head_dim divisible by 8, and this guarantees head_dim == args.head_dim exactly)
-    base_dim = depth * args.aspect_ratio
-    model_dim = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
+    base_dim = depth * args.aspect_ratio #  这里让模型宽度与深度成比例
+    model_dim = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim # 向上取整dim head
     num_heads = model_dim // args.head_dim
     config = GPTConfig(
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
     )
-    with torch.device("meta"):
+    with torch.device("meta"): # 先在 meta 上搭建结构 再直接在目标 GPU 分配参数  避免中间的完整 CPU 模型。
         model_meta = GPT(config)
     return model_meta
 
 # Build the model, move to device, init the weights
 model = build_model_meta(args.depth) # 1) Build on meta device (only shapes/dtypes, no data)
 model_config = model.config
-model_config_kwargs = asdict(model_config)
+model_config_kwargs = asdict(model_config) # 因为 GPTConfig 是 dataclass，asdict() 将它转换成普通字典：
 print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
-model.to_empty(device=device) # 2) All tensors get storage on target device but with uninitialized (garbage) data
+model.to_empty(device=device) # 2) All tensors get storage on target device but with uninitialized (garbage) data meta 参数转换成目标设备上的真实张量存储。
 model.init_weights() # 3) All tensors get initialized
 
 # If we are resuming, overwrite the model parameters with those of the checkpoint

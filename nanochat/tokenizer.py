@@ -1,5 +1,26 @@
 """
 BPE Tokenizer in the style of GPT-4: train with rustbpe, inference with tiktoken.
+训练阶段：
+        训练文本
+          ↓
+        rustbpe 统计和学习 BPE 合并规则
+          ↓
+        得到 pattern + mergeable_ranks
+          ↓
+        构造 tiktoken.Encoding
+
+        使用阶段：
+        文本
+          ↓
+        tiktoken.encode_ordinary()
+          ↓
+        token IDs
+          ↓
+        模型
+          ↓
+        tiktoken.decode()
+          ↓
+        文本
 """
 
 import os
@@ -8,22 +29,39 @@ from functools import lru_cache
 
 SPECIAL_TOKENS = [
     # every document begins with the Beginning of Sequence (BOS) token that delimits documents
-    "<|bos|>",
+    "<|bos|>", # 一篇文档或一个序列的开始
     # tokens below are only used during finetuning to render Conversations into token ids
     "<|user_start|>", # user messages
     "<|user_end|>",
     "<|assistant_start|>", # assistant messages
     "<|assistant_end|>",
-    "<|python_start|>", # assistant invokes python REPL tool
-    "<|python_end|>",
-    "<|output_start|>", # python REPL outputs back to assistant
+    "<|python_start|>", # assistant invokes python REPL tool Python 工具调用开始
+    "<|python_end|>", 
+    "<|output_start|>", # python REPL outputs back to assistant # 工具输出开始
     "<|output_end|>",
 ]
 
 # NOTE: this split pattern deviates from GPT-4 in that we use \p{N}{1,2} instead of \p{N}{1,3}
 # I did this because I didn't want to "waste" too many tokens on numbers for smaller vocab sizes.
 # I verified that 2 is the sweet spot for vocab size of 32K. 1 is a bit worse, 3 was worse still.
-SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
+SPLIT_PATTERN = r"""
+'(?i:[sdmt]|ll|ve|re)
+|[^\r\n\p{L}\p{N}]?+\p{L}+
+|\p{N}{1,2}
+| ?[^\s\p{L}\p{N}]++[\r\n]*
+|\s*[\r\n]
+|\s+(?!\S)
+|\s+
+"""
+
+"""
+1、 '(?i:[sdmt]|ll|ve|re) 匹配英语缩写结尾，并且忽略大小写
+2、[^\r\n\p{L}\p{N}]?+\p{L}+  \p{L} → Unicode 字母  \p{N} → Unicode 数字
+3、  ?[^\s\p{L}\p{N}]++[\r\n]* 可选空格开头的一串符号
+4、 \s*[\r\n] 换行及换行前的空白
+5、\s+(?!\S)  (?!\S)向后看一眼，要求下一个字符不是非空白字符；
+6、
+"""
 
 # -----------------------------------------------------------------------------
 # Tokenizer based on rustbpe + tiktoken combo
@@ -36,7 +74,7 @@ class RustBPETokenizer:
 
     def __init__(self, enc, bos_token):
         self.enc = enc
-        self.bos_token_id = self.encode_special(bos_token)
+        self.bos_token_id = self.encode_special(bos_token) # 需要当作 BOS 使用的特殊 token 字符串。 例如：  "<|bos|>" → 32759
 
     @classmethod
     def train_from_iterator(cls, text_iterator, vocab_size):
@@ -46,10 +84,31 @@ class RustBPETokenizer:
         vocab_size_no_special = vocab_size - len(SPECIAL_TOKENS)
         assert vocab_size_no_special >= 256, f"vocab_size_no_special must be at least 256, got {vocab_size_no_special}"
         tokenizer.train_from_iterator(text_iterator, vocab_size_no_special, pattern=SPLIT_PATTERN)
+        """
+        从 text_iterator 读取文本
+        ↓
+        使用 SPLIT_PATTERN 预分割
+        ↓
+        转换成 UTF-8 bytes
+        ↓
+        从 256 个 byte token 开始
+        ↓
+        不断合并高频相邻 token
+        ↓
+        达到 vocab_size_no_special
+        """
         # 2) construct the associated tiktoken encoding for inference
-        pattern = tokenizer.get_pattern()
-        mergeable_ranks_list = tokenizer.get_mergeable_ranks()
-        mergeable_ranks = {bytes(k): v for k, v in mergeable_ranks_list}
+        pattern = tokenizer.get_pattern() # 取出训练时使用的正则表达式。
+        mergeable_ranks_list = tokenizer.get_mergeable_ranks() # 取出 BPE 学到的普通 token 和对应 rank。
+        mergeable_ranks = {bytes(k): v for k, v in mergeable_ranks_list} # 转成 tiktoken 要求的rank字典  通常 rank 越小，说明这个 merge 越早被学习，编码时优先级越高。
+        """
+        {
+            b"a": 64,
+            b"the": 1000,
+            b"ing": 1001,
+            b" hello": 2000,
+        }
+        """
         tokens_offset = len(mergeable_ranks)
         special_tokens = {name: tokens_offset + i for i, name in enumerate(SPECIAL_TOKENS)}
         enc = tiktoken.Encoding(
@@ -86,11 +145,12 @@ class RustBPETokenizer:
     def id_to_token(self, id):
         return self.enc.decode([id])
 
-    @lru_cache(maxsize=32)
+    @lru_cache(maxsize=32) # 缓存最多 32 个调用结果。 特殊 token 只有 9 个，而且会被反复查询，所以缓存很合适。
     def encode_special(self, text):
         return self.enc.encode_single_token(text)
 
-    def get_bos_token_id(self):
+    # 它返回初始化时 <|bos|> 这个特定特殊 token 的 ID
+    def get_bos_token_id(self): 
         return self.bos_token_id
 
     def encode(self, text, prepend=None, append=None, num_threads=8):
@@ -119,13 +179,16 @@ class RustBPETokenizer:
             raise ValueError(f"Invalid input type: {type(text)}")
 
         return ids
-
-    def __call__(self, *args, **kwargs):
+    
+    # 允许直接调用 tokenizer  因此：tokenizer("hello") 等价于 tokenizer.encode("hello")
+    def __call__(self, *args, **kwargs): 
         return self.encode(*args, **kwargs)
 
+    # 将 token ID 列表还原为字符串。
     def decode(self, ids):
         return self.enc.decode(ids)
 
+    # 返回单个 token 对应的原始 bytes。 
     def decode_single_token_bytes(self, token_id):
         return self.enc.decode_single_token_bytes(token_id)
 
@@ -141,10 +204,15 @@ class RustBPETokenizer:
         """
         Tokenize a single Chat conversation (which we call a "doc" or "document" here).
         Returns:
-        - ids: list[int] is a list of token ids of this rendered conversation
-        - mask: list[int] of same length, mask = 1 for tokens that the Assistant is expected to train on.
+        - ids: list[int] is a list of token ids of this rendered conversation 对话 token； 
+        - mask: list[int] of same length, mask = 1 for tokens that the Assistant is expected to train on. 哪些 token 参与训练 loss。
         """
         # ids, masks that we will return and a helper function to help build them up.
+        """
+        用于同时向 ids 和 mask 添加内容。
+        add_tokens([10, 11, 12], 1) --> ids  += [10, 11, 12]
+                                        mask += [1, 1, 1]
+        """
         ids, mask = [], []
         def add_tokens(token_ids, mask_val):
             if isinstance(token_ids, int):
@@ -154,6 +222,13 @@ class RustBPETokenizer:
 
         # sometimes the first message is a system message...
         # => just merge it with the second (user) message
+        # 把 system 内容和 user 内容合并，中间添加两个换行。
+        """
+        
+        system: You are helpful      --->   user: You are helpful
+        user: Hello                      
+                                         Hello
+        """     
         if conversation["messages"][0]["role"] == "system":
             # some conversation surgery is necessary here for now...
             conversation = copy.deepcopy(conversation) # avoid mutating the original
@@ -173,7 +248,7 @@ class RustBPETokenizer:
         output_start, output_end = self.encode_special("<|output_start|>"), self.encode_special("<|output_end|>")
 
         # now we can tokenize the conversation
-        add_tokens(bos, 0)
+        add_tokens(bos, 0)  # 每个 conversation 都以 BOS 开始。
         for i, message in enumerate(messages):
 
             # some sanity checking here around assumptions, to prevent footguns
